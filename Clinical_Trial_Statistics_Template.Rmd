@@ -1,0 +1,307 @@
+---
+title: "临床试验常用统计分析方法（R Markdown 模板）"
+author: "Your Name"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  word_document:
+    toc: true
+    toc_depth: 3
+    reference_docx: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# 1. 加载常用包
+
+```{r libraries}
+library(tidyverse)
+library(tableone)
+library(gtsummary)
+library(broom)
+library(car)
+library(pROC)
+library(forestplot)
+library(survival)
+library(survminer)
+library(lme4)
+library(DescTools)        # Cochran-Armitage 趋势检验
+library(irr)              # Kappa 一致性
+library(BlandAltmanLeh)   # Bland-Altman 图
+library(epitools)         # 风险比/比值比
+library(flextable)
+```
+
+# 2. 数据模拟与导入
+
+> 为了便于演示，本模板先 **模拟一个随机对照试验数据集**（并行两组），同时提供一个 **长格式的重复测量数据集** 用于混合效应模型。实际项目中请将此部分替换为真实数据导入。
+
+```{r simulate-data}
+set.seed(20251112)
+
+# 受试者样本量
+N <- 300
+
+# 分组、基线协变量
+subject_id <- sprintf("S%03d", 1:N)
+group      <- sample(c("Treatment", "Control"), size = N, replace = TRUE)
+age        <- round(rnorm(N, mean = 58, sd = 10))
+gender     <- sample(c("Male", "Female"), size = N, replace = TRUE, prob = c(0.48, 0.52))
+BMI        <- round(rnorm(N, mean = 26, sd = 4), 1)
+
+# 基线与终点（连续型，如收缩压）
+Baseline_BP <- round(rnorm(N, mean = 145, sd = 15))
+# 设定治疗组平均降压更明显
+true_tx_effect <- -8  # 治疗相对对照的平均变化
+Final_BP <- round(Baseline_BP +
+                  rnorm(N, mean = ifelse(group == "Treatment", true_tx_effect, -3), sd = 10))
+
+SBP_change <- Final_BP - Baseline_BP
+
+# 二分类主要终点（如达到反应）
+# 设定治疗组更易达到反应
+linpred <- -1 + 0.5*(group == "Treatment") - 0.01*(age - 58) - 0.02*(BMI - 26)
+pr_resp <- plogis(linpred)
+response <- rbinom(N, 1, pr_resp)
+
+# 安全性（不良事件）
+AE_occurrence <- rbinom(N, 1, prob = ifelse(group == "Treatment", 0.18, 0.22))
+AE <- factor(ifelse(AE_occurrence == 0,
+                    "None",
+                    sample(c("Mild", "Severe"), size = N, replace = TRUE, prob = c(0.75, 0.25))))
+
+# 生存数据（随访时间与事件）
+# 设定治疗组风险略低
+baseline_hazard <- rexp(N, rate = 1/365)  # 约一年时间尺度
+tx_hr  <- 0.80
+linpred_surv <- log(ifelse(group == "Treatment", tx_hr, 1.0))
+time  <- pmin(  # 限制到两年内
+  rexp(N, rate = exp(-linpred_surv) / 400),
+  730
+)
+# 固定比例的删失
+censor <- rbinom(N, 1, prob = 0.30)
+event  <- ifelse(censor == 1, 0, 1)
+
+# 趋势检验（剂量-反应）
+dose_group <- factor(sample(c("Low","Medium","High"), N, replace = TRUE, prob = c(0.3,0.4,0.3)),
+                     ordered = TRUE, levels = c("Low","Medium","High"))
+
+# 评价者一致性与方法学一致性数据
+doc1   <- factor(sample(c("Positive","Negative"), N, replace = TRUE, prob = c(0.55,0.45)))
+# doc2 与 doc1 有一定一致性
+doc2   <- factor(ifelse(runif(N) < 0.75, as.character(doc1),
+                        sample(c("Positive","Negative"), N, replace = TRUE)))
+method1 <- rnorm(N, mean = 50, sd = 10)
+method2 <- method1 + rnorm(N, mean = 0, sd = 5) + ifelse(group=="Treatment", -1, 0)
+
+# 主要数据框（**受试者级别**）
+data <- tibble(
+  subject_id, group, age, gender, BMI,
+  Baseline_BP, Final_BP, SBP_change,
+  response = factor(response, levels = c(0,1), labels = c("No","Yes")),
+  AE_occurrence = factor(AE_occurrence, levels = c(0,1), labels = c("No","Yes")),
+  AE,
+  time = as.numeric(time),
+  event = as.numeric(event),
+  dose_group,
+  doc1, doc2,
+  method1, method2
+)
+
+glimpse(data)
+
+# 构造**重复测量长格式**（例如 0/4/8/12 周 SBP）
+time_points <- c(0, 4, 8, 12)
+data_long <- map_dfr(time_points, function(ti){
+  tibble(
+    subject_id = subject_id,
+    group      = group,
+    time       = ti,                          # 周
+    SBP        = Baseline_BP +
+                 (ti/12) * (ifelse(group == "Treatment", -12, -5)) +
+                 rnorm(N, 0, 6)
+  )
+}) %>% arrange(subject_id, time)
+
+glimpse(data_long)
+```
+
+> 如果要改为真实数据，请注释掉上面的“模拟”代码块，并使用如下导入：
+>
+> ```r
+> data <- readr::read_csv("cleaned_data.csv")
+> data_long <- readr::read_csv("your_long_data.csv")  # 若有重复测量
+> ```
+
+# 3. 基线比较
+
+## 3.1 连续变量：t 检验与秩和检验
+
+```{r baseline-ttest-wilcox}
+# 以收缩压（基线）为例
+t.test(Baseline_BP ~ group, data = data)
+
+# 非正态时可用 Wilcoxon 秩和检验
+wilcox.test(Baseline_BP ~ group, data = data)
+```
+
+## 3.2 分类变量：卡方与 Fisher 精确检验
+
+```{r baseline-categorical}
+# 性别
+chisq.test(table(data$group, data$gender))
+
+# AE 发生（可能稀疏，示例用 Fisher）
+fisher.test(table(data$group, data$AE_occurrence))
+```
+
+# 4. 主要终点 - 连续结局（ANCOVA）
+
+> 结局为 **最终收缩压 Final_BP**，协变量包含 **组别、基线值、年龄、性别**。
+
+```{r ancova}
+ancova_model <- lm(Final_BP ~ group + Baseline_BP + age + gender, data = data)
+summary(ancova_model)
+anova(ancova_model)
+
+# 效应量与置信区间（以组别为主）
+ancova_est <- broom::tidy(ancova_model, conf.int = TRUE)
+ancova_est %>% dplyr::filter(term == "groupTreatment")
+```
+
+# 5. 主要终点 - 二分类结局（Logistic 回归）
+
+```{r logistic}
+logit_model <- glm(response ~ group + age + gender + BMI,
+                   data = data, family = binomial)
+
+summary(logit_model)
+
+# 使用 broom 输出 OR 与 95% CI
+logit_tidy <- broom::tidy(logit_model, conf.int = TRUE, exponentiate = TRUE)
+logit_tidy
+```
+
+# 6. 生存分析（KM + Cox）
+
+```{r survival}
+# Kaplan-Meier 曲线
+fit <- survfit(Surv(time, event) ~ group, data = data)
+ggsurvplot(fit, data = data, pval = TRUE, risk.table = TRUE)
+
+# Cox 比例风险回归
+cox_model <- coxph(Surv(time, event) ~ group + age + gender, data = data)
+summary(cox_model)
+
+# 回归表（HR）：用 broom 生成数据框，避免 gtsummary 依赖
+cox_tbl <- broom::tidy(cox_model, exponentiate = TRUE, conf.int = TRUE) %>%
+  dplyr::mutate(term = dplyr::recode(term, `groupTreatment` = "Treatment vs Control")) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  dplyr::rename(HR = estimate, `95% CI low` = conf.low, `95% CI high` = conf.high, `p` = p.value)
+cox_tbl
+```
+
+# 7. 重复测量与混合效应模型
+
+> 注意：此处使用的是 **data_long** 长格式数据。
+
+```{r mixed-models}
+# 线性混合效应模型（LMM）：随机截距（按受试者）
+lmm <- lmer(SBP ~ time * group + (1|subject_id), data = data_long)
+anova(lmm)
+summary(lmm)
+
+# GLMM 示例（若重复结局为二分类事件，可参考如下结构；此处演示用伪造事件）
+set.seed(1)
+data_long$event_bin <- rbinom(nrow(data_long), 1,
+                              plogis(-1 + 0.1*data_long$time/4 + ifelse(data_long$group=="Treatment",-0.3,0)))
+
+glmm <- glmer(event_bin ~ time * group + (1|subject_id),
+              data = data_long, family = binomial)
+summary(glmm)
+```
+
+# 8. 趋势检验（剂量-反应）
+
+```{r trend-test}
+# 需要一个 2xK 或 Kx2 的列联表（K 为有序剂量水平）
+tab_dose <- table(data$dose_group, data$response)
+tab_dose
+CochranArmitageTest(tab_dose)
+```
+
+# 9. 一致性分析（评价者间 & 方法学）
+
+```{r agreement}
+# 评价者间一致性（Kappa）
+kappa2(data.frame(rater1 = data$doc1, rater2 = data$doc2))
+
+# 方法学一致性（Bland-Altman）
+bland.altman.plot(data$method1, data$method2,
+                  graph.sys = "base",
+                  main = "Bland-Altman Plot: method1 vs method2")
+```
+
+# 10. 亚组与交互作用分析
+
+```{r interaction}
+glm_interaction <- glm(response ~ group * gender + age,
+                       data = data, family = binomial)
+summary(glm_interaction)
+
+# 交互项的比值比与 CI
+broom::tidy(glm_interaction, conf.int = TRUE, exponentiate = TRUE)
+```
+
+# 11. 安全性分析（不良事件）
+
+```{r safety}
+# 发生率比较（2x2 表）
+tab_ae_occ <- table(data$group, data$AE_occurrence)
+tab_ae_occ
+fisher.test(tab_ae_occ)
+
+# 风险比（Risk Ratio）—— 仅适用于 2x2
+riskratio(tab_ae_occ)
+
+# AE 类型分布（多分类，仅做分布/卡方）
+tab_ae <- table(data$group, data$AE)
+tab_ae
+chisq.test(tab_ae)
+```
+
+# 12. 结果导出与报告（Word）
+
+```{r export, results='hide'}
+# 将 Cox 回归表导出为 Word（可扩展为多个表）
+ft <- flextable::flextable(cox_tbl)
+flextable::save_as_docx("Cox_Regression" = ft, path = "Clinical_Trial_Analysis_Report.docx")
+```
+
+> ✅ 已导出 Word 报告：**Clinical_Trial_Analysis_Report.docx**（包含 Cox 回归结果示例）。
+> 可在实际项目中按需加入更多表格（如 Logistic 回归、ANCOVA 结果、基线 Table 1 等）。
+
+# 13. 附：基线 Table 1（可选）
+
+```{r table1, message=FALSE}
+vars <- c("age", "gender", "BMI", "Baseline_BP", "Final_BP")
+tab1 <- CreateTableOne(vars = vars, strata = "group", data = data, test = TRUE)
+print(tab1, showAllLevels = TRUE)
+
+# 或使用 gtsummary：
+data %>%
+  select(group, age, gender, BMI, Baseline_BP, Final_BP) %>%
+  tbl_summary(by = group) %>%
+  add_p() %>%
+  bold_labels()
+```
